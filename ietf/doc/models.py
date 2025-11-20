@@ -1,4 +1,4 @@
-# Copyright The IETF Trust 2010-2023, All Rights Reserved
+# Copyright The IETF Trust 2010-2025, All Rights Reserved
 # -*- coding: utf-8 -*-
 
 
@@ -913,6 +913,7 @@ class DocumentActionHolder(models.Model):
             roles.append('Action Holder')
         return ', '.join(roles) 
 
+# N.B., at least a couple dozen documents exist that do not satisfy this validator
 validate_docname = RegexValidator(
     r'^[-a-z0-9]+$',
     "Provide a valid document name consisting of lowercase letters, numbers and hyphens.",
@@ -1157,7 +1158,7 @@ class Document(StorableMixin, DocumentInfo):
             elif rev_events.exists():
                 time = rev_events.first().time
             else:
-                time = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+                time = datetime.datetime.fromtimestamp(0, datetime.UTC)
             dh = DocHistory(name=self.name, rev=rev, doc=self, time=time, type=self.type, title=self.title,
                              stream=self.stream, group=self.group)
 
@@ -1588,8 +1589,16 @@ class BofreqResponsibleDocEvent(DocEvent):
     """ Capture the responsible leadership (IAB and IESG members) for a BOF Request """
     responsible = models.ManyToManyField('person.Person', blank=True)
 
+
+class StoredObjectQuerySet(models.QuerySet):
+    def exclude_deleted(self):
+        return self.filter(deleted__isnull=True)
+
+
 class StoredObject(models.Model):
     """Hold metadata about objects placed in object storage"""
+
+    objects = StoredObjectQuerySet.as_manager() 
 
     store = models.CharField(max_length=256)
     name = models.CharField(max_length=1024, null=False, blank=False) # N.B. the 1024 limit on name comes from S3
@@ -1615,3 +1624,6 @@ class StoredObject(models.Model):
         indexes = [
             models.Index(fields=["doc_name", "doc_rev"]),
         ]
+
+    def __str__(self):
+        return f"{self.store}:{self.name}"

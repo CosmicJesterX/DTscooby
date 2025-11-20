@@ -1,4 +1,4 @@
-# Copyright The IETF Trust 2009-2024, All Rights Reserved
+# Copyright The IETF Trust 2009-2025, All Rights Reserved
 # -*- coding: utf-8 -*-
 import datetime
 import io
@@ -12,9 +12,10 @@ import requests.exceptions
 import requests_mock
 
 from unittest import skipIf
-from mock import call, patch, PropertyMock
+from unittest.mock import call, patch, PropertyMock
 from pyquery import PyQuery
 from lxml.etree import tostring
+from icalendar import Calendar
 from io import StringIO, BytesIO
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urlsplit
@@ -48,15 +49,18 @@ from ietf.meeting.helpers import send_interim_meeting_cancellation_notice, send_
 from ietf.meeting.helpers import send_interim_minutes_reminder, populate_important_dates, update_important_dates
 from ietf.meeting.models import Session, TimeSlot, Meeting, SchedTimeSessAssignment, Schedule, SessionPresentation, SlideSubmission, SchedulingEvent, Room, Constraint, ConstraintName
 from ietf.meeting.test_data import make_meeting_test_data, make_interim_meeting, make_interim_test_data
-from ietf.meeting.utils import condition_slide_order, generate_proceedings_content
+from ietf.meeting.utils import (
+    condition_slide_order,
+    generate_proceedings_content,
+    diff_meeting_schedules,
+)
 from ietf.meeting.utils import add_event_info_to_session_qs, participants_for_meeting
 from ietf.meeting.utils import create_recording, delete_recording, get_next_sequence, bluesheet_data
 from ietf.meeting.views import session_draft_list, parse_agenda_filter_params, sessions_post_save, agenda_extract_schedule
 from ietf.meeting.views import get_summary_by_area, get_summary_by_type, get_summary_by_purpose, generate_agenda_data
 from ietf.name.models import SessionStatusName, ImportantDateName, RoleName, ProceedingsMaterialTypeName
-from ietf.utils.decorators import skip_coverage
 from ietf.utils.mail import outbox, empty_outbox, get_payload_text
-from ietf.utils.test_runner import TestBlobstoreManager
+from ietf.utils.test_runner import TestBlobstoreManager, disable_coverage
 from ietf.utils.test_utils import TestCase, login_testing_unauthorized, unicontent
 from ietf.utils.timezone import date_today, time_now
 
@@ -66,8 +70,7 @@ from ietf.meeting.factories import (SessionFactory, ScheduleFactory,
     SessionPresentationFactory, MeetingFactory, FloorPlanFactory,
     TimeSlotFactory, SlideSubmissionFactory, RoomFactory,
     ConstraintFactory, MeetingHostFactory, ProceedingsMaterialFactory,
-    AttendedFactory)
-from ietf.stats.factories import MeetingRegistrationFactory
+    AttendedFactory, RegistrationFactory)
 from ietf.doc.factories import DocumentFactory, WgDraftFactory
 from ietf.submit.tests import submission_file
 from ietf.utils.test_utils import assert_ical_response_is_valid
@@ -321,11 +324,11 @@ class MeetingTests(BaseMeetingTestCase):
         self.assertContains(r, session.group.parent.acronym.upper())
         self.assertContains(r, slot.location.name)
         self.assertContains(r, "{}-{}".format(
-            slot.time.astimezone(datetime.timezone.utc).strftime("%H%M"),
-            (slot.time + slot.duration).astimezone(datetime.timezone.utc).strftime("%H%M"),
+            slot.time.astimezone(datetime.UTC).strftime("%H%M"),
+            (slot.time + slot.duration).astimezone(datetime.UTC).strftime("%H%M"),
         ))
         self.assertContains(r, "shown in UTC")
-        updated = meeting.updated().astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+        updated = meeting.updated().astimezone(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S %Z")
         self.assertContains(r, f"Updated {updated}")
 
         # text, invalid updated (none)
@@ -369,8 +372,8 @@ class MeetingTests(BaseMeetingTestCase):
         self.assertContains(r, session.group.parent.acronym.upper())
         self.assertContains(r, slot.location.name)
         self.assertContains(r, registration_text)
-        start_time = slot.time.astimezone(datetime.timezone.utc)
-        end_time = slot.end_time().astimezone(datetime.timezone.utc)
+        start_time = slot.time.astimezone(datetime.UTC)
+        end_time = slot.end_time().astimezone(datetime.UTC)
         self.assertContains(r, '"{}","{}","{}"'.format(
             start_time.strftime("%Y-%m-%d"),
             start_time.strftime("%H%M"),
@@ -385,9 +388,6 @@ class MeetingTests(BaseMeetingTestCase):
         r = self.client.get(ical_url)
 
         assert_ical_response_is_valid(self, r)
-        self.assertContains(r, "BEGIN:VTIMEZONE")
-        self.assertContains(r, "END:VTIMEZONE")
-        self.assertContains(r, meeting.time_zone, msg_prefix="time_zone should appear in its original case")
         self.assertNotEqual(
             meeting.time_zone,
             meeting.time_zone.lower(),
@@ -406,21 +406,32 @@ class MeetingTests(BaseMeetingTestCase):
         assert_ical_response_is_valid(self, r)
         self.assertContains(r, session.group.acronym)
         self.assertContains(r, session.group.name)
-        self.assertContains(r, session.remote_instructions)
-        self.assertContains(r, slot.location.name)
-        self.assertContains(r, 'https://onsite.example.com')
-        self.assertContains(r, 'https://meetecho.example.com')
-        self.assertContains(r, "BEGIN:VTIMEZONE")
-        self.assertContains(r, "END:VTIMEZONE")        
 
-        self.assertContains(r, session.agenda().get_href())
-        self.assertContains(
-            r,
+        cal = Calendar.from_ical(r.content)
+        events = [component for component in cal.walk() if component.name == "VEVENT"]
+
+        self.assertEqual(len(events), 2)
+        self.assertIn(session.remote_instructions, events[0].get('description'))
+        self.assertIn("Onsite tool: https://onsite.example.com", events[0].get('description'))
+        self.assertIn("Meetecho: https://meetecho.example.com", events[0].get('description'))
+        self.assertIn(f"Agenda {session.agenda().get_href()}", events[0].get('description'))
+        session_materials_url = settings.IDTRACKER_BASE_URL + urlreverse(
+            'ietf.meeting.views.session_details',
+            kwargs=dict(num=meeting.number, acronym=session.group.acronym)
+        )
+        self.assertIn(f"Session materials: {session_materials_url}", events[0].get('description'))
+        self.assertIn(
             urlreverse(
                 'ietf.meeting.views.session_details',
                 kwargs=dict(num=meeting.number, acronym=session.group.acronym)),
-            msg_prefix='ical should contain link to meeting materials page for session')
+            events[0].get('description'))
+        self.assertEqual(
+            session_materials_url,
+            events[0].get('url')
+        )
 
+        self.assertContains(r, f"LOCATION:{slot.location.name}")
+        
         # Floor Plan
         r = self.client.get(urlreverse('floor-plan', kwargs=dict(num=meeting.number)))
         self.assertEqual(r.status_code, 200)
@@ -1029,7 +1040,7 @@ class MeetingTests(BaseMeetingTestCase):
 
         updated = meeting.updated()
         self.assertIsNotNone(updated)
-        expected_updated = updated.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        expected_updated = updated.astimezone(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
         self.assertContains(r, f"DTSTAMP:{expected_updated}")
         dtstamps_count = r.content.decode("utf-8").count(f"DTSTAMP:{expected_updated}")
         self.assertEqual(dtstamps_count, meeting.importantdate_set.count())
@@ -1050,32 +1061,36 @@ class MeetingTests(BaseMeetingTestCase):
         s1 = Session.objects.filter(meeting=meeting, group__acronym="mars").first()
         a1 = s1.official_timeslotassignment()
         t1 = a1.timeslot
+
         # Create an extra session
         t2 = TimeSlotFactory.create(
             meeting=meeting,
-            time=meeting.tz().localize(
+            time=pytz.utc.localize(
                 datetime.datetime.combine(meeting.date, datetime.time(11, 30))
             )
         )
+     
         s2 = SessionFactory.create(meeting=meeting, group=s1.group, add_to_schedule=False)
         SchedTimeSessAssignment.objects.create(timeslot=t2, session=s2, schedule=meeting.schedule)
-        #
+        
         url = urlreverse('ietf.meeting.views.agenda_ical', kwargs={'num':meeting.number, 'acronym':s1.group.acronym, })
         r = self.client.get(url)
         assert_ical_response_is_valid(self,
                                       r,
                                       expected_event_summaries=['mars - Martian Special Interest Group'],
                                       expected_event_count=2)
-        self.assertContains(r, t1.local_start_time().strftime('%Y%m%dT%H%M%S'))
-        self.assertContains(r, t2.local_start_time().strftime('%Y%m%dT%H%M%S'))
-        #
+        self.assertContains(r, f"DTSTART:{t1.time.strftime('%Y%m%dT%H%M%SZ')}")
+        self.assertContains(r, f"DTEND:{(t1.time + t1.duration).strftime('%Y%m%dT%H%M%SZ')}")
+        self.assertContains(r, f"DTSTART:{t2.time.strftime('%Y%m%dT%H%M%SZ')}")
+        self.assertContains(r, f"DTEND:{(t2.time + t2.duration).strftime('%Y%m%dT%H%M%SZ')}")
+
         url = urlreverse('ietf.meeting.views.agenda_ical', kwargs={'num':meeting.number, 'session_id':s1.id, })
         r = self.client.get(url)
         assert_ical_response_is_valid(self, r,
                                       expected_event_summaries=['mars - Martian Special Interest Group'],
                                       expected_event_count=1)
-        self.assertContains(r, t1.local_start_time().strftime('%Y%m%dT%H%M%S'))
-        self.assertNotContains(r, t2.local_start_time().strftime('%Y%m%dT%H%M%S'))
+        self.assertContains(r, f"DTSTART:{t1.time.strftime('%Y%m%dT%H%M%SZ')}")
+        self.assertNotContains(r, f"DTSTART:{t2.time.strftime('%Y%m%dT%H%M%SZ')}")
 
     def test_parse_agenda_filter_params(self):
         def _r(show=(), hide=(), showtypes=(), hidetypes=()):
@@ -1169,8 +1184,8 @@ class MeetingTests(BaseMeetingTestCase):
                 os.unlink(filename)
 
     @skipIf(skip_pdf_tests, skip_message)
-    @skip_coverage
-    def test_session_draft_pdf(self):
+    @disable_coverage()
+    def test_session_draft_pdf(self):  # pragma: no cover
         session, filenames = self.build_session_setup()
         try:
             url = urlreverse('ietf.meeting.views.session_draft_pdf', kwargs={'num':session.meeting.number,'acronym':session.group.acronym})
@@ -2105,8 +2120,8 @@ class EditMeetingScheduleTests(TestCase):
         # strftime() does not seem to support hours without leading 0, so do this manually
         time_label_string = f'{ts_start.hour:d}:{ts_start.minute:02d} - {ts_end.hour:d}:{ts_end.minute:02d}'
         self.assertIn(time_label_string, time_label.text())
-        self.assertEqual(time_label.attr('data-start'), ts_start.astimezone(datetime.timezone.utc).isoformat())
-        self.assertEqual(time_label.attr('data-end'), ts_end.astimezone(datetime.timezone.utc).isoformat())
+        self.assertEqual(time_label.attr('data-start'), ts_start.astimezone(datetime.UTC).isoformat())
+        self.assertEqual(time_label.attr('data-end'), ts_end.astimezone(datetime.UTC).isoformat())
 
         ts_swap = time_label.find('.swap-timeslot-col')
         origin_label = ts_swap.attr('data-origin-label')
@@ -2117,8 +2132,8 @@ class EditMeetingScheduleTests(TestCase):
 
         timeslot_elt = pq(f'#timeslot{timeslot.pk}')
         self.assertEqual(len(timeslot_elt), 1)
-        self.assertEqual(timeslot_elt.attr('data-start'), ts_start.astimezone(datetime.timezone.utc).isoformat())
-        self.assertEqual(timeslot_elt.attr('data-end'), ts_end.astimezone(datetime.timezone.utc).isoformat())
+        self.assertEqual(timeslot_elt.attr('data-start'), ts_start.astimezone(datetime.UTC).isoformat())
+        self.assertEqual(timeslot_elt.attr('data-end'), ts_end.astimezone(datetime.UTC).isoformat())
 
         timeslot_label = pq(f'#timeslot{timeslot.pk} .time-label')
         self.assertEqual(len(timeslot_label), 1)
@@ -4754,73 +4769,151 @@ class EditScheduleListTests(TestCase):
         self.assertTrue(r.status_code, 200)
 
     def test_diff_schedules(self):
-        meeting = make_meeting_test_data()
+        # Create meeting and some time slots
+        meeting = MeetingFactory(type_id="ietf", populate_schedule=False)
+        rooms = RoomFactory.create_batch(2, meeting=meeting)
+        # first index is room, second is time
+        timeslots = [
+            [
+                TimeSlotFactory(
+                    location=room,
+                    meeting=meeting,
+                    time=datetime.datetime.combine(
+                        meeting.date, datetime.time(9, 0, tzinfo=datetime.UTC)
+                    )
+                ),
+                TimeSlotFactory(
+                    location=room,
+                    meeting=meeting,
+                    time=datetime.datetime.combine(
+                        meeting.date, datetime.time(10, 0, tzinfo=datetime.UTC)
+                    )
+                ),
+                TimeSlotFactory(
+                    location=room,
+                    meeting=meeting,
+                    time=datetime.datetime.combine(
+                        meeting.date, datetime.time(11, 0, tzinfo=datetime.UTC)
+                    )
+                ),
+            ]
+            for room in rooms
+        ]
+        sessions = SessionFactory.create_batch(
+            5, meeting=meeting, add_to_schedule=False
+        )
 
-        url = urlreverse('ietf.meeting.views.diff_schedules',kwargs={'num':meeting.number})
-        login_testing_unauthorized(self,"secretary", url)
+        from_schedule = ScheduleFactory(meeting=meeting)
+        to_schedule = ScheduleFactory(meeting=meeting)
+
+        # sessions[0]: not scheduled in from_schedule, scheduled in to_schedule
+        SchedTimeSessAssignment.objects.create(
+            schedule=to_schedule,
+            session=sessions[0],
+            timeslot=timeslots[0][0],
+        )
+        # sessions[1]: scheduled in from_schedule, not scheduled in to_schedule
+        SchedTimeSessAssignment.objects.create(
+            schedule=from_schedule,
+            session=sessions[1],
+            timeslot=timeslots[0][0],
+        )
+        # sessions[2]: moves rooms, not time
+        SchedTimeSessAssignment.objects.create(
+            schedule=from_schedule,
+            session=sessions[2],
+            timeslot=timeslots[0][1],
+        )
+        SchedTimeSessAssignment.objects.create(
+            schedule=to_schedule,
+            session=sessions[2],
+            timeslot=timeslots[1][1],
+        )
+        # sessions[3]: moves time, not room
+        SchedTimeSessAssignment.objects.create(
+            schedule=from_schedule,
+            session=sessions[3],
+            timeslot=timeslots[1][1],
+        )
+        SchedTimeSessAssignment.objects.create(
+            schedule=to_schedule,
+            session=sessions[3],
+            timeslot=timeslots[1][2],
+        )
+        # sessions[4]: moves room and time
+        SchedTimeSessAssignment.objects.create(
+            schedule=from_schedule,
+            session=sessions[4],
+            timeslot=timeslots[1][0],
+        )
+        SchedTimeSessAssignment.objects.create(
+            schedule=to_schedule,
+            session=sessions[4],
+            timeslot=timeslots[0][2],
+        )
+
+        # Check the raw diffs
+        raw_diffs = diff_meeting_schedules(from_schedule, to_schedule)
+        self.assertCountEqual(
+            raw_diffs,
+            [
+                {
+                    "change": "schedule",
+                    "session": sessions[0].pk,
+                    "to": timeslots[0][0].pk,
+                },
+                {
+                    "change": "unschedule",
+                    "session": sessions[1].pk,
+                    "from": timeslots[0][0].pk,
+                },
+                {
+                    "change": "move",
+                    "session": sessions[2].pk,
+                    "from": timeslots[0][1].pk,
+                    "to": timeslots[1][1].pk,
+                },
+                {
+                    "change": "move",
+                    "session": sessions[3].pk,
+                    "from": timeslots[1][1].pk,
+                    "to": timeslots[1][2].pk,
+                },
+                {
+                    "change": "move",
+                    "session": sessions[4].pk,
+                    "from": timeslots[1][0].pk,
+                    "to": timeslots[0][2].pk,
+                },
+            ]
+        )
+
+        # Check the view
+        url = urlreverse("ietf.meeting.views.diff_schedules",
+                         kwargs={"num": meeting.number})
+        login_testing_unauthorized(self, "secretary", url)
         r = self.client.get(url)
         self.assertTrue(r.status_code, 200)
 
-        from_schedule = Schedule.objects.get(meeting=meeting, name="test-unofficial-schedule")
-
-        session1 = Session.objects.filter(meeting=meeting, group__acronym='mars').first()
-        session2 = Session.objects.filter(meeting=meeting, group__acronym='ames').first()
-        session3 = SessionFactory(meeting=meeting, group=Group.objects.get(acronym='mars'),
-                                  attendees=10, requested_duration=datetime.timedelta(minutes=70),
-                                  add_to_schedule=False)
-        SchedulingEvent.objects.create(session=session3, status_id='schedw', by=Person.objects.first())
-
-        slot2 = TimeSlot.objects.filter(meeting=meeting, type='regular').order_by('-time').first()
-        slot3 = TimeSlot.objects.create(
-            meeting=meeting, type_id='regular', location=slot2.location,
-            duration=datetime.timedelta(minutes=60),
-            time=slot2.time + datetime.timedelta(minutes=60),
-        )
-
-        # copy
-        new_url = urlreverse("ietf.meeting.views.new_meeting_schedule", kwargs=dict(num=meeting.number, owner=from_schedule.owner_email(), name=from_schedule.name))
-        r = self.client.post(new_url, {
-            'name': "newtest",
-            'public': "on",
-        })
-        self.assertNoFormPostErrors(r)
-
-        to_schedule = Schedule.objects.get(meeting=meeting, name='newtest')
-
-        # make some changes
-
-        edit_url = urlreverse("ietf.meeting.views.edit_meeting_schedule", kwargs=dict(num=meeting.number, owner=to_schedule.owner_email(), name=to_schedule.name))
-
-        # schedule session
-        r = self.client.post(edit_url, {
-            'action': 'assign',
-            'timeslot': slot3.pk,
-            'session': session3.pk,
-        })
-        self.assertEqual(json.loads(r.content)['success'], True)
-        # unschedule session
-        r = self.client.post(edit_url, {
-            'action': 'unassign',
-            'session': session1.pk,
-        })
-        self.assertEqual(json.loads(r.content)['success'], True)
-        # move session
-        r = self.client.post(edit_url, {
-            'action': 'assign',
-            'timeslot': slot2.pk,
-            'session': session2.pk,
-        })
-        self.assertEqual(json.loads(r.content)['success'], True)
-
-        # now get differences
+        # with show room changes disabled - does not show sessions[2] because it did 
+        # not change time
         r = self.client.get(url, {
-            'from_schedule': from_schedule.name,
-            'to_schedule': to_schedule.name,
+            "from_schedule": from_schedule.name,
+            "to_schedule": to_schedule.name,
         })
         self.assertTrue(r.status_code, 200)
-
         q = PyQuery(r.content)
-        self.assertEqual(len(q(".schedule-diffs tr")), 3+1)
+        self.assertEqual(len(q(".schedule-diffs tr")), 4 + 1)
+
+        # with show room changes enabled - shows all changes
+        r = self.client.get(url, {
+            "from_schedule": from_schedule.name,
+            "to_schedule": to_schedule.name,
+            "show_room_changes": "on",
+        })
+        self.assertTrue(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertEqual(len(q(".schedule-diffs tr")), 5 + 1)
 
     def test_delete_schedule(self):
         url = urlreverse('ietf.meeting.views.delete_schedule',
@@ -5209,7 +5302,9 @@ class InterimTests(TestCase):
         assert_ical_response_is_valid(self, r,
                                       expected_event_summaries=expected_event_summaries,
                                       expected_event_count=len(expected_event_summaries))
-        self.assertContains(r, 'Remote instructions: https://someurl.example.com')
+        # Unfold long lines that might have been folded by iCal
+        content_unfolded = r.content.decode('utf-8').replace('\r\n ', '')
+        self.assertIn('Remote instructions: https://someurl.example.com', content_unfolded)
 
         Session.objects.filter(meeting__type_id='interim').update(remote_instructions='')
         r = self.client.get(url)
@@ -5217,11 +5312,12 @@ class InterimTests(TestCase):
         assert_ical_response_is_valid(self, r,
                                       expected_event_summaries=expected_event_summaries,
                                       expected_event_count=len(expected_event_summaries))
-        self.assertNotContains(r, 'Remote instructions:')
+        content_unfolded = r.content.decode('utf-8').replace('\r\n ', '')
+        self.assertNotIn('Remote instructions:', content_unfolded)
 
         updated = meeting.updated()
         self.assertIsNotNone(updated)
-        expected_updated = updated.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        expected_updated = updated.astimezone(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
         self.assertContains(r, f"DTSTAMP:{expected_updated}")
 
         # With default cached_updated, 1970-01-01
@@ -7055,7 +7151,7 @@ class MaterialsTests(TestCase):
             self.assertFalse(exists_in_storage("staging", submission.filename))
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
-        self.assertRegex(r.content.decode(), r"These\s+slides\s+have\s+already\s+been\s+rejected")
+        self.assertRegex(r.content.decode(), r"These\s+slides\s+have\s+already\s+been\s+declined")
 
     @override_settings(MEETECHO_API_CONFIG="fake settings")  # enough to trigger API calls
     @patch("ietf.meeting.views.SlidesManager")
@@ -7543,7 +7639,7 @@ class SessionTests(TestCase):
         )
         def _sreq_edit_link(sess):
             return urlreverse(
-                'ietf.secr.sreq.views.edit',
+                'ietf.meeting.views_session_request.edit_request',
                 kwargs={
                     'num': meeting.number,
                     'acronym': sess.group.acronym,
@@ -8852,25 +8948,24 @@ class ProceedingsTests(BaseMeetingTestCase):
            - prefer onsite checkedin=True to remote attended when same person has both
         """
 
-        meeting = MeetingFactory(type_id='ietf', date=datetime.date(2023, 11, 4), number="118")
+        m = MeetingFactory(type_id='ietf', date=datetime.date(2023, 11, 4), number="118")
         person_a = PersonFactory(name='Person A')
         person_b = PersonFactory(name='Person B')
         person_c = PersonFactory(name='Person C')
         person_d = PersonFactory(name='Person D')
-        MeetingRegistrationFactory(meeting=meeting, person=person_a, reg_type='onsite', checkedin=True)
-        MeetingRegistrationFactory(meeting=meeting, person=person_b, reg_type='onsite', checkedin=False)
-        MeetingRegistrationFactory(meeting=meeting, person=person_a, reg_type='remote')
-        AttendedFactory(session__meeting=meeting, session__type_id='plenary', person=person_a)
-        MeetingRegistrationFactory(meeting=meeting, person=person_c, reg_type='remote')
-        AttendedFactory(session__meeting=meeting, session__type_id='plenary', person=person_c)
-        MeetingRegistrationFactory(meeting=meeting, person=person_d, reg_type='remote')
+        areg = RegistrationFactory(meeting=m, person=person_a, checkedin=True, with_ticket={'attendance_type_id': 'onsite'})
+        RegistrationFactory(meeting=m, person=person_b, checkedin=False, with_ticket={'attendance_type_id': 'onsite'})
+        creg = RegistrationFactory(meeting=m, person=person_c, with_ticket={'attendance_type_id': 'remote'})
+        RegistrationFactory(meeting=m, person=person_d, with_ticket={'attendance_type_id': 'remote'})
+        AttendedFactory(session__meeting=m, session__type_id='plenary', person=person_a)
+        AttendedFactory(session__meeting=m, session__type_id='plenary', person=person_c)
         url = urlreverse('ietf.meeting.views.proceedings_attendees',kwargs={'num': 118})
         response = self.client.get(url)
         self.assertContains(response, 'Attendee list')
         q = PyQuery(response.content)
         self.assertEqual(2, len(q("#id_attendees tbody tr")))
         text = q('#id_attendees tbody tr').text().replace('\n', ' ')
-        self.assertEqual(text, "A Person onsite C Person remote")
+        self.assertEqual(text, f"A Person {areg.affiliation} {areg.country_code} onsite C Person {creg.affiliation} {creg.country_code} remote")
 
     def test_proceedings_overview(self):
         '''Test proceedings IETF Overview page.
@@ -9271,27 +9366,25 @@ class ProceedingsTests(BaseMeetingTestCase):
         self.assertEqual(sequence,1)
 
     def test_participants_for_meeting(self):
-        person_a = PersonFactory()
-        person_b = PersonFactory()
-        person_c = PersonFactory()
-        person_d = PersonFactory()
         m = MeetingFactory.create(type_id='ietf')
-        MeetingRegistrationFactory(meeting=m, person=person_a, reg_type='onsite', checkedin=True)
-        MeetingRegistrationFactory(meeting=m, person=person_b, reg_type='onsite', checkedin=False)
-        MeetingRegistrationFactory(meeting=m, person=person_c, reg_type='remote')
-        MeetingRegistrationFactory(meeting=m, person=person_d, reg_type='remote')
-        AttendedFactory(session__meeting=m, session__type_id='plenary', person=person_c)
+        areg = RegistrationFactory(meeting=m, checkedin=True, with_ticket={'attendance_type_id': 'onsite'})
+        breg = RegistrationFactory(meeting=m, checkedin=False, with_ticket={'attendance_type_id': 'onsite'})
+        creg = RegistrationFactory(meeting=m, with_ticket={'attendance_type_id': 'remote'})
+        dreg = RegistrationFactory(meeting=m, with_ticket={'attendance_type_id': 'remote'})
+        AttendedFactory(session__meeting=m, session__type_id='plenary', person=creg.person)
         checked_in, attended = participants_for_meeting(m)
-        self.assertTrue(person_a.pk in checked_in)
-        self.assertTrue(person_b.pk not in checked_in)
-        self.assertTrue(person_c.pk in attended)
-        self.assertTrue(person_d.pk not in attended)
+        self.assertIn(areg.person.pk, checked_in)
+        self.assertNotIn(breg.person.pk, checked_in)
+        self.assertNotIn(areg.person.pk, attended)
+        self.assertNotIn(breg.person.pk, attended)
+        self.assertIn(creg.person.pk, attended)
+        self.assertNotIn(dreg.person.pk, attended)
 
     def test_session_attendance(self):
         meeting = MeetingFactory(type_id='ietf', date=datetime.date(2023, 11, 4), number='118')
         make_meeting_test_data(meeting=meeting)
         session = Session.objects.filter(meeting=meeting, group__acronym='mars').first()
-        regs = MeetingRegistrationFactory.create_batch(3, meeting=meeting)
+        regs = RegistrationFactory.create_batch(3, meeting=meeting)
         persons = [reg.person for reg in regs]
         self.assertEqual(session.attended_set.count(), 0)
 
@@ -9337,7 +9430,7 @@ class ProceedingsTests(BaseMeetingTestCase):
         # person0 is already on the bluesheet
         _test_button(persons[0], False)
         # person3 attests he was there
-        persons.append(MeetingRegistrationFactory(meeting=meeting).person)
+        persons.append(RegistrationFactory(meeting=meeting).person)
         # button isn't shown if we're outside the corrections windows
         meeting.importantdate_set.create(name_id='revsub',date=date_today() - datetime.timedelta(days=20))
         _test_button(persons[3], False)
@@ -9395,12 +9488,12 @@ class ProceedingsTests(BaseMeetingTestCase):
 
     def test_bluesheet_data(self):
         session = SessionFactory(meeting__type_id="ietf") 
-        attended_with_affil = MeetingRegistrationFactory(meeting=session.meeting, affiliation="Somewhere")
+        attended_with_affil = RegistrationFactory(meeting=session.meeting, affiliation="Somewhere")
         AttendedFactory(session=session, person=attended_with_affil.person, time="2023-03-13T01:24:00Z")  # joined 2nd
-        attended_no_affil = MeetingRegistrationFactory(meeting=session.meeting)
+        attended_no_affil = RegistrationFactory(meeting=session.meeting, affiliation="")
         AttendedFactory(session=session, person=attended_no_affil.person, time="2023-03-13T01:23:00Z")  # joined 1st
-        MeetingRegistrationFactory(meeting=session.meeting)  # did not attend
-        
+        RegistrationFactory(meeting=session.meeting)  # did not attend
+
         data = bluesheet_data(session)
         self.assertEqual(
             data,
